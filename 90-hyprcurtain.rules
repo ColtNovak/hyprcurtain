@@ -1,0 +1,4 @@
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="input[0-9]*", RUN+="/usr/bin/chgrp input /sys%p/inhibited", RUN+="/usr/bin/chmod g+w /sys%p/inhibited"
+
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="input[0-9]*", PROGRAM=="/usr/bin/sh -c 'ls /run/user/*/hyprcurtain'", DEVPATH!="/devices/virtual/*", ATTR{inhibited}="1"
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="input[0-9]*", PROGRAM=="/usr/bin/sh -c 'ls /run/user/*/hyprcurtain'", ATTR{id/bustype}=="0005", ATTR{inhibited}="1"

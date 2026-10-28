@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SCALE=
+RESTART="waybar awww-daemon"
+SILENCE_INPUT=1
+LOCK_CMD="hyprlock --grace 0 --immediate-render --no-fade-in"
+NO_CLIENT_TIMEOUT=60
+SUNSHINE_LOG="$HOME/.config/sunshine/sunshine.log"
+SUNSHINE_USER=
+SUNSHINE_PASSWORD_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/hyprcurtain/sunshine-password"
+SUNSHINE_UNIT=
+LOCK_ON_LOGIN=0
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/hyprcurtain/config"
+[[ -f $CONFIG ]] && . "$CONFIG"
+
+RUNDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STATE="$RUNDIR/hyprcurtain"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/hyprcurtain.log"
+mkdir -p "$(dirname "$LOG")"
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+if [[ ! -S $RUNDIR/hypr/${HYPRLAND_INSTANCE_SIGNATURE:-none}/.socket.sock ]]; then
+    for sig in $(ls -t "$RUNDIR/hypr" 2>/dev/null); do
+        if [[ -S $RUNDIR/hypr/$sig/.socket.sock ]]; then
+            export HYPRLAND_INSTANCE_SIGNATURE=$sig
+            break
+        fi
+    done
+fi
+
+active() { hyprctl monitors -j 2>/dev/null | jq -r '.[].name'; }
+has_output() { hyprctl monitors all -j 2>/dev/null | jq -e 'any(.[]; .name == "STREAM")' >/dev/null; }
+physical_outputs() { hyprctl monitors all -j 2>/dev/null | jq -r '.[].name | select(. != "STREAM")'; }
+
+physical_inputs() {
+    local d
+    for d in /sys/class/input/input*; do
+        if [[ $(readlink -f "$d") != /sys/devices/virtual/* ]] ||
+           [[ $(cat "$d/id/bustype" 2>/dev/null) == 0005 ]] ||
+           [[ $(cat "$d/name" 2>/dev/null) == *"WMI hotkeys"* ]]; then
+            echo "$d"
+        fi
+    done
+}
+
+silence_inputs() {
+    [[ $SILENCE_INPUT == 1 ]] || return
+    local d
+    for d in $(physical_inputs); do echo 1 > "$d/inhibited" 2>/dev/null; done
+}
+
+release_inputs() {
+    [[ $SILENCE_INPUT == 1 ]] || return
+    local f
+    for f in /sys/class/input/input*/inhibited; do
+        [[ $(cat "$f" 2>/dev/null) == 1 ]] && echo 0 > "$f" 2>/dev/null
+    done
+}
+
+restart_clients() {
+    local name
+    for name in $RESTART; do
+        if systemctl --user is-active --quiet "$name.service"; then
+            systemctl --user restart "$name.service"
+        elif pgrep -u "$USER" -x "$name" >/dev/null; then
+            pkill -u "$USER" -x "$name"
+            sleep 0.5
+            hyprctl dispatch "hl.dsp.exec_cmd(\"$name\")" >/dev/null
+        fi
+    done
+}
+
+refresh_desktop() { restart_clients >/dev/null 2>&1 & }
+
+lock_now() {
+    local locker
+    locker=$(basename "$(echo "$LOCK_CMD" | awk '{print $1}')")
+    pgrep -u "$USER" -x "$locker" >/dev/null && return
+    hyprctl dispatch "hl.dsp.exec_cmd(\"$LOCK_CMD\")" >/dev/null 2>&1
+    for _ in $(seq 30); do
+        pgrep -u "$USER" -x "$locker" >/dev/null && break
+        sleep 0.1
+    done
+    sleep 0.5
+}
+
+start() {
+    local w=${SUNSHINE_CLIENT_WIDTH:-1920} h=${SUNSHINE_CLIENT_HEIGHT:-1080} f=${SUNSHINE_CLIENT_FPS:-60}
+    local scale=$SCALE ws
+    if [[ -z $scale ]]; then
+        scale=1
+        (( h >= 1000 )) && scale=1.2
+        (( h >= 2000 )) && scale=2
+    fi
+    log "start: ${w}x${h}@${f} scale $scale"
+
+    ws=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // empty')
+    echo "${w}x${h}@${f} $scale" > "$STATE"
+    {
+        echo "hl.monitor({ output = \"STREAM\", mode = \"${w}x${h}@${f}\", position = \"0x0\", scale = $scale })"
+        echo "hl.monitor({ output = \"\", disabled = true })"
+        for name in $(physical_outputs); do
+            echo "hl.monitor({ output = \"$name\", disabled = true })"
+        done
+    } > "$STATE.lua"
+    silence_inputs
+    has_output || hyprctl output create headless STREAM >/dev/null 2>&1
+    hyprctl reload >/dev/null 2>&1
+
+    for _ in $(seq 50); do
+        if [[ $(active) == "STREAM" ]]; then
+            if [[ -n $ws ]] && hyprctl workspaces -j | jq -e --argjson id "$ws" 'any(.[]; .id == $id)' >/dev/null; then
+                hyprctl dispatch "hl.dsp.focus({ workspace = $ws })" >/dev/null 2>&1
+            fi
+            refresh_desktop
+            log "start: STREAM is the only output"
+            return
+        fi
+        sleep 0.1
+    done
+
+    log "start: STREAM did not come up, locking and refusing the stream"
+    lock_now
+    rm -f "$STATE" "$STATE.lua"
+    hyprctl reload >/dev/null 2>&1
+    has_output && hyprctl output remove STREAM >/dev/null 2>&1
+    refresh_desktop
+    release_inputs
+}
+
+stop() {
+    if [[ ! -f $STATE ]] && ! has_output; then
+        [[ ${1:-} == --lock ]] && lock_now
+        release_inputs
+        return
+    fi
+    log "stop: locking, restoring screens"
+    lock_now
+    rm -f "$STATE" "$STATE.lua"
+    hyprctl reload >/dev/null 2>&1
+    has_output && hyprctl output remove STREAM >/dev/null 2>&1
+    for _ in $(seq 30); do
+        [[ -n $(active) ]] && break
+        sleep 0.1
+    done
+    refresh_desktop
+    release_inputs
+}
+
+end_session() {
+    local user=$SUNSHINE_USER code=skipped
+    [[ -z $user ]] && user=$(jq -r '.username // empty' "$HOME/.config/sunshine/sunshine_state.json" 2>/dev/null)
+    if [[ -n $user && -r $SUNSHINE_PASSWORD_FILE ]]; then
+        local pass
+        pass=$(head -1 "$SUNSHINE_PASSWORD_FILE")
+        code=$(echo "user = \"$user:$pass\"" | curl -sk -K - -o /dev/null -w '%{http_code}' --max-time 5 -X POST https://localhost:47990/api/apps/close)
+    fi
+    log "watch: $1, closing app ($code)"
+    "$0" stop --lock
+}
+
+watch() {
+    [[ -r $SUNSHINE_PASSWORD_FILE ]] || log "watch: no SUNSHINE_PASSWORD_FILE, can't close the app on disconnect"
+    local connected=0 since=0 line
+    tail -n0 -F "$SUNSHINE_LOG" 2>/dev/null | while true; do
+        if IFS= read -r -t 5 line; then
+            case $line in
+                *"CLIENT CONNECTED"*) connected=1 ;;
+                *"CLIENT DISCONNECTED"*) connected=0; end_session "client disconnected" ;;
+                *"Ping Timeout"*) connected=0; end_session "connection lost" ;;
+                *"Starting main loop"*) connected=0 ;;
+            esac
+        fi
+        if [[ -f $STATE && $connected == 0 ]]; then
+            if [[ $since == 0 ]]; then
+                since=$SECONDS
+            fi
+            if (( SECONDS - since >= NO_CLIENT_TIMEOUT )); then
+                since=0
+                end_session "no client after ${NO_CLIENT_TIMEOUT}s"
+            fi
+        else
+            since=0
+        fi
+    done
+}
+
+login() {
+    if [[ $LOCK_ON_LOGIN == 1 || ${AUTOLOGIN_LOCK:-} == 1 ]]; then
+        (until $LOCK_CMD; do sleep 1; done) &
+    fi
+    local unit=$SUNSHINE_UNIT u
+    if [[ -z $unit ]]; then
+        for u in app-dev.lizardbyte.app.Sunshine.service sunshine.service; do
+            systemctl --user cat "$u" >/dev/null 2>&1 && { unit=$u; break; }
+        done
+    fi
+    [[ -n $unit ]] || log "login: no sunshine unit found, set SUNSHINE_UNIT"
+    systemctl --user start $unit hyprcurtain.service
+    wait
+}
+
+status() {
+    if [[ -f $STATE ]]; then echo "streaming: $(head -1 "$STATE")"; else echo "not streaming"; fi
+    echo "outputs: $(active | tr '\n' ' ')"
+    echo "silenced inputs: $(grep -l '^1' /sys/class/input/input*/inhibited 2>/dev/null | wc -l)"
+}
+
+case ${1:-} in
+    start|stop)
+        exec 9>"$STATE.lock"
+        flock -w 20 9
+        "$1" "${2:-}"
+        ;;
+    watch) watch ;;
+    login) login ;;
+    status) status ;;
+    *) echo "usage: hyprcurtain start|stop|status" >&2; exit 1 ;;
+esac
+exit 0
