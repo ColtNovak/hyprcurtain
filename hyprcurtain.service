@@ -1,0 +1,12 @@
+[Unit]
+Description=Lock the screen when a Moonlight client disconnects
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=@BIN@/hyprcurtain watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
